@@ -1,0 +1,13 @@
+*.bak*
+*.tmp
+*.log
+bin/
+obj/
+.vs/
+docx_render_*/
+outputs/
+work/
+__pycache__/
+build_ttfm_h1_manual.py*
+H1_TTFM_Context_Engine_说明书.pdf
+H1_TTFM_Context_Engine_里程碑说明书.docx

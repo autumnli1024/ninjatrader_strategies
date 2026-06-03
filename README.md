@@ -4,18 +4,28 @@ This repository mirrors selected NinjaTrader 8 custom source files used for ICT 
 
 ## Current milestone
 
+### Strategies
+
+- `Strategies/Setup_Engine.cs`
+- `Strategies/ICT_Setup_Engine.cs`
+- `Strategies/ICT_Setup_Types.cs`
 - `Strategies/TTFM_Context_Engine.cs`
-  - H1/H4 TTFM context strategy.
-  - Candle number state machine for C2-C6.
-  - Independent CISD state machine.
-  - HTF PDA / FVG ROI integration.
-  - NT8 relay bridge publishing and snapshot support.
 - `Strategies/TTFM_Types.cs`
-  - Shared TTFM context data contracts and bus.
-- `AddOns/NT8RelayBridge.cs`
-  - Local HTTP bridge for Codex/AI access to NT8 context snapshots and memory bus.
+
+### Indicators
+
 - `Indicators/ICT_HTF_PDA_Projector.cs`
-  - HTF imbalance / PDA ROI source used by TTFM context.
+- `Indicators/ICT_Structure_Suite.cs`
+- `Indicators/TimeCyclesLiquiditySweep.cs`
+- `Indicators/ICT_SMT_MTF.cs`
+- `Indicators/ICT_PDA_Suite.cs`
+- `Indicators/ICT_OrderBlock_Suite.cs`
+- `Indicators/ICT_HTF_Suite_Ultimate/ICT_HTF_Suite_Ultimate/ICT_HTF_Suite_Ultimate.cs`
+
+### AddOns
+
+- `AddOns/NT8RelayBridge.cs`
+- `AddOns/@@NT8ChartBridge.cs`
 
 ## Notes
 

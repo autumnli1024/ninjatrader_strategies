@@ -101,6 +101,7 @@ namespace NinjaTrader.NinjaScript.Strategies
 		private double pendingStopMovePrice = double.NaN;
 		private string pendingStopMoveReason = string.Empty;
 		private string lastOrderMessage = string.Empty;
+		private string lastTtfmGateState = "TTFM gate not checked";
 		private Grid controlPanelGrid;
 		private TextBlock controlPanelStatus;
 		private bool setupEngineRebuildRequested;
@@ -142,6 +143,9 @@ namespace NinjaTrader.NinjaScript.Strategies
 				VisualDealingRangeMode = ICTDealingRangeMode.LiveCycle;
 				VisualOteFibDirection = ICTOteFibDirection.Auto;
 				DebugPrint = false;
+				UseTtfmChildGate = true;
+				TtfmParentContextKey = "MNQ_H4_TTFM_MAIN";
+				TtfmChildContextKey = string.Empty;
 				TradeLong = true;
 				TradeShort = true;
 				UseICT2022Setup = true;
@@ -1096,6 +1100,14 @@ namespace NinjaTrader.NinjaScript.Strategies
 		private void TryEnter(ICTSetupSignal signal)
 		{
 			string reason;
+			if (!PassesTtfmChildGate(signal, out reason))
+			{
+				panel.Status = "BLOCKED";
+				panel.BlockReason = reason;
+				Debug("BLOCKED " + reason + " | " + DescribeSignal(signal));
+				return;
+			}
+
 			if (signal != null && signal.Direction == ICTTradeDirection.Long && !TradeLong)
 			{
 				panel.Status = "BLOCKED";
@@ -1201,6 +1213,63 @@ namespace NinjaTrader.NinjaScript.Strategies
 			entrySubmitBar = CurrentBar;
 			panel.Status = "ARMED";
 			Debug("ENTER " + signal.Direction + " " + entryName + " qty=" + qty + " | " + DescribeSignal(signal));
+		}
+
+		private bool PassesTtfmChildGate(ICTSetupSignal signal, out string reason)
+		{
+			reason = string.Empty;
+			if (!UseTtfmChildGate)
+			{
+				lastTtfmGateState = "TTFM gate off";
+				return true;
+			}
+
+			string key = ResolveTtfmChildContextKey();
+			TTFM_Context ttfm;
+			if (!TTFM_Context_Bus.TryGet(key, out ttfm))
+			{
+				reason = "TTFM child context missing: " + key;
+				lastTtfmGateState = reason;
+				return false;
+			}
+
+			if (!ttfm.IsInsideParentCandleWindow)
+			{
+				reason = "TTFM gate blocked: outside parent candle window.";
+				lastTtfmGateState = reason;
+				return false;
+			}
+			if (!ttfm.AiSetupGate)
+			{
+				reason = "TTFM gate blocked: " + ttfm.AiSetupGateReason;
+				lastTtfmGateState = reason;
+				return false;
+			}
+			if (signal != null && signal.Direction == ICTTradeDirection.Long && ttfm.AllowedDirection == ICTContextDirection.ShortOnly)
+			{
+				reason = "TTFM gate blocked: parent allows ShortOnly.";
+				lastTtfmGateState = reason;
+				return false;
+			}
+			if (signal != null && signal.Direction == ICTTradeDirection.Short && ttfm.AllowedDirection == ICTContextDirection.LongOnly)
+			{
+				reason = "TTFM gate blocked: parent allows LongOnly.";
+				lastTtfmGateState = reason;
+				return false;
+			}
+
+			lastTtfmGateState = "TTFM gate OK: C" + ttfm.ChildParentCandleNumber + " " + ttfm.AllowedDirection;
+			return true;
+		}
+
+		private string ResolveTtfmChildContextKey()
+		{
+			if (!string.IsNullOrWhiteSpace(TtfmChildContextKey))
+				return TtfmChildContextKey.Trim();
+
+			int minutes = BarsPeriod != null ? Math.Max(1, BarsPeriod.Value) : 0;
+			string parentKey = string.IsNullOrWhiteSpace(TtfmParentContextKey) ? string.Empty : TtfmParentContextKey.Trim();
+			return parentKey + "_CHILD_" + minutes + "M";
 		}
 
 		private void ConfigureStopsAndTargets(string entryName, int quantity, ICTSetupSignal signal, double safeStop)
@@ -2220,6 +2289,7 @@ namespace NinjaTrader.NinjaScript.Strategies
 				"Model/Zone: " + s.EntryModel + " | " + FormatPrice(s.ZoneTop) + " / " + FormatPrice(s.ZoneBottom) + "\n" +
 				"Live: " + Position.MarketPosition + " " + FormatPrice(activeEntryPrice) + " / " + FormatPrice(activeStopPrice) + " / " + FormatPrice(activeTargetPrice) + "\n" +
 				"Trades/PnL: " + panel.TradesToday + " / " + panel.DailyPnL.ToString("0.00") + "\n" +
+				"TTFM: " + lastTtfmGateState + "\n" +
 				"Order: " + lastOrderMessage + "\n" +
 				"Block: " + panel.BlockReason;
 
@@ -2838,6 +2908,18 @@ namespace NinjaTrader.NinjaScript.Strategies
 		[NinjaScriptProperty]
 		[Display(Name = "Show Floating Control Panel", GroupName = "00. Master", Order = 4)]
 		public bool ShowControlPanel { get; set; }
+
+		[NinjaScriptProperty]
+		[Display(Name = "Use TTFM Child Gate", GroupName = "00. Master", Order = 5)]
+		public bool UseTtfmChildGate { get; set; }
+
+		[NinjaScriptProperty]
+		[Display(Name = "TTFM Parent Context Key", GroupName = "00. Master", Order = 6)]
+		public string TtfmParentContextKey { get; set; }
+
+		[NinjaScriptProperty]
+		[Display(Name = "TTFM Child Context Key", GroupName = "00. Master", Order = 7)]
+		public string TtfmChildContextKey { get; set; }
 
 		[NinjaScriptProperty]
 		[Display(Name = "Use Three Push Bonus", GroupName = "03. Setup Switches", Order = 7)]

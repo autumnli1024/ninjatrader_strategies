@@ -22,6 +22,7 @@ namespace NinjaTrader.NinjaScript.Strategies
 		public string Key = string.Empty;
 		public string Instrument = string.Empty;
 		public string Profile = "D1-H1-M5-M1";
+		public int ContextTfMinutes;
 		public DateTime PublishedAt = Core.Globals.MinDate;
 		public DateTime BarTime = Core.Globals.MinDate;
 		public double CurrentPrice = double.NaN;
@@ -34,6 +35,21 @@ namespace NinjaTrader.NinjaScript.Strategies
 		public int SetupId;
 		public int SetupAgeBars;
 		public string FailureReason = string.Empty;
+		public string ChildTfState = "None";
+		public string ChildContextKey = string.Empty;
+		public int ChildTfMinutes;
+		public DateTime ChildBarTime = Core.Globals.MinDate;
+		public int ChildParentCandleNumber;
+		public DateTime ChildParentCandleStartTime = Core.Globals.MinDate;
+		public DateTime ChildParentCandleEndTime = Core.Globals.MinDate;
+		public double ChildParentCandleHigh = double.NaN;
+		public double ChildParentCandleLow = double.NaN;
+		public double ChildParentCandleOpen = double.NaN;
+		public double ChildParentCandleClose = double.NaN;
+		public bool IsInsideParentCandleWindow;
+		public string AiInterfaceVersion = "TTFM-AI-1";
+		public bool AiSetupGate;
+		public string AiSetupGateReason = string.Empty;
 		public int SequenceDirection;
 		public int CurrentCandleNumber;
 		public bool TSpotTouched;
@@ -75,6 +91,18 @@ namespace NinjaTrader.NinjaScript.Strategies
 		public double C4Close = double.NaN;
 		public DateTime C4Time = Core.Globals.MinDate;
 
+		public double C5High = double.NaN;
+		public double C5Low = double.NaN;
+		public double C5Open = double.NaN;
+		public double C5Close = double.NaN;
+		public DateTime C5Time = Core.Globals.MinDate;
+
+		public double C6High = double.NaN;
+		public double C6Low = double.NaN;
+		public double C6Open = double.NaN;
+		public double C6Close = double.NaN;
+		public DateTime C6Time = Core.Globals.MinDate;
+
 		public double TSpotUpper = double.NaN;
 		public double TSpotLower = double.NaN;
 		public double ProtectedSwing = double.NaN;
@@ -83,9 +111,11 @@ namespace NinjaTrader.NinjaScript.Strategies
 		public double NearestBullZoneTop = double.NaN;
 		public double NearestBullZoneBottom = double.NaN;
 		public double NearestBullZoneCE = double.NaN;
+		public DateTime NearestBullZoneStartTime = Core.Globals.MinDate;
 		public double NearestBearZoneTop = double.NaN;
 		public double NearestBearZoneBottom = double.NaN;
 		public double NearestBearZoneCE = double.NaN;
+		public DateTime NearestBearZoneStartTime = Core.Globals.MinDate;
 		public string RoiSource = string.Empty;
 		public int RoiHtfMinutes;
 		public int RoiActiveBias;
@@ -149,6 +179,7 @@ namespace NinjaTrader.NinjaScript.Strategies
 				Key = source.Key,
 				Instrument = source.Instrument,
 				Profile = source.Profile,
+				ContextTfMinutes = source.ContextTfMinutes,
 				PublishedAt = source.PublishedAt,
 				BarTime = source.BarTime,
 				CurrentPrice = source.CurrentPrice,
@@ -161,6 +192,21 @@ namespace NinjaTrader.NinjaScript.Strategies
 				SetupId = source.SetupId,
 				SetupAgeBars = source.SetupAgeBars,
 				FailureReason = source.FailureReason,
+				ChildTfState = source.ChildTfState,
+				ChildContextKey = source.ChildContextKey,
+				ChildTfMinutes = source.ChildTfMinutes,
+				ChildBarTime = source.ChildBarTime,
+				ChildParentCandleNumber = source.ChildParentCandleNumber,
+				ChildParentCandleStartTime = source.ChildParentCandleStartTime,
+				ChildParentCandleEndTime = source.ChildParentCandleEndTime,
+				ChildParentCandleHigh = source.ChildParentCandleHigh,
+				ChildParentCandleLow = source.ChildParentCandleLow,
+				ChildParentCandleOpen = source.ChildParentCandleOpen,
+				ChildParentCandleClose = source.ChildParentCandleClose,
+				IsInsideParentCandleWindow = source.IsInsideParentCandleWindow,
+				AiInterfaceVersion = source.AiInterfaceVersion,
+				AiSetupGate = source.AiSetupGate,
+				AiSetupGateReason = source.AiSetupGateReason,
 				SequenceDirection = source.SequenceDirection,
 				CurrentCandleNumber = source.CurrentCandleNumber,
 				TSpotTouched = source.TSpotTouched,
@@ -197,6 +243,16 @@ namespace NinjaTrader.NinjaScript.Strategies
 				C4Open = source.C4Open,
 				C4Close = source.C4Close,
 				C4Time = source.C4Time,
+				C5High = source.C5High,
+				C5Low = source.C5Low,
+				C5Open = source.C5Open,
+				C5Close = source.C5Close,
+				C5Time = source.C5Time,
+				C6High = source.C6High,
+				C6Low = source.C6Low,
+				C6Open = source.C6Open,
+				C6Close = source.C6Close,
+				C6Time = source.C6Time,
 				TSpotUpper = source.TSpotUpper,
 				TSpotLower = source.TSpotLower,
 				ProtectedSwing = source.ProtectedSwing,
@@ -204,9 +260,11 @@ namespace NinjaTrader.NinjaScript.Strategies
 				NearestBullZoneTop = source.NearestBullZoneTop,
 				NearestBullZoneBottom = source.NearestBullZoneBottom,
 				NearestBullZoneCE = source.NearestBullZoneCE,
+				NearestBullZoneStartTime = source.NearestBullZoneStartTime,
 				NearestBearZoneTop = source.NearestBearZoneTop,
 				NearestBearZoneBottom = source.NearestBearZoneBottom,
 				NearestBearZoneCE = source.NearestBearZoneCE,
+				NearestBearZoneStartTime = source.NearestBearZoneStartTime,
 				RoiSource = source.RoiSource,
 				RoiHtfMinutes = source.RoiHtfMinutes,
 				RoiActiveBias = source.RoiActiveBias,

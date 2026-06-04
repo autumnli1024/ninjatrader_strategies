@@ -369,6 +369,7 @@ namespace NinjaTrader.NinjaScript.AddOns
                 key = context.Key,
                 instrument = context.Instrument,
                 profile = context.Profile,
+                context_tf_minutes = context.ContextTfMinutes,
                 published_at = context.PublishedAt.ToString("o"),
                 bar_time = context.BarTime.ToString("o"),
                 current_price = context.CurrentPrice,
@@ -380,6 +381,30 @@ namespace NinjaTrader.NinjaScript.AddOns
                 setup_id = context.SetupId,
                 setup_age_bars = context.SetupAgeBars,
                 failure_reason = context.FailureReason,
+                child_context_key = context.ChildContextKey,
+                child_tf_minutes = context.ChildTfMinutes,
+                child_bar_time = context.ChildBarTime.ToString("o"),
+                child_tf_state = context.ChildTfState,
+                child_parent_candle_number = context.ChildParentCandleNumber,
+                child_parent_candle_start = context.ChildParentCandleStartTime.ToString("o"),
+                child_parent_candle_end = context.ChildParentCandleEndTime.ToString("o"),
+                child_parent_candle = new
+                {
+                    number = context.ChildParentCandleNumber,
+                    start = context.ChildParentCandleStartTime.ToString("o"),
+                    end = context.ChildParentCandleEndTime.ToString("o"),
+                    open = context.ChildParentCandleOpen,
+                    high = context.ChildParentCandleHigh,
+                    low = context.ChildParentCandleLow,
+                    close = context.ChildParentCandleClose,
+                    inside = context.IsInsideParentCandleWindow
+                },
+                ai = new
+                {
+                    interface_version = context.AiInterfaceVersion,
+                    setup_gate = context.AiSetupGate,
+                    setup_gate_reason = context.AiSetupGateReason
+                },
                 sequence_direction = context.SequenceDirection,
                 current_candle_number = context.CurrentCandleNumber,
                 tspot_touched = context.TSpotTouched,
@@ -429,6 +454,22 @@ namespace NinjaTrader.NinjaScript.AddOns
                     low = context.C4Low,
                     close = context.C4Close
                 },
+                c5 = new
+                {
+                    time = context.C5Time.ToString("o"),
+                    open = context.C5Open,
+                    high = context.C5High,
+                    low = context.C5Low,
+                    close = context.C5Close
+                },
+                c6 = new
+                {
+                    time = context.C6Time.ToString("o"),
+                    open = context.C6Open,
+                    high = context.C6High,
+                    low = context.C6Low,
+                    close = context.C6Close
+                },
                 t_spot_upper = context.TSpotUpper,
                 t_spot_lower = context.TSpotLower,
                 protected_swing = context.ProtectedSwing,
@@ -439,9 +480,25 @@ namespace NinjaTrader.NinjaScript.AddOns
                 nearest_bull_zone_top = context.NearestBullZoneTop,
                 nearest_bull_zone_bottom = context.NearestBullZoneBottom,
                 nearest_bull_zone_ce = context.NearestBullZoneCE,
+                nearest_bull_zone_start = context.NearestBullZoneStartTime.ToString("o"),
+                bull_roi = new
+                {
+                    top = context.NearestBullZoneTop,
+                    bottom = context.NearestBullZoneBottom,
+                    ce = context.NearestBullZoneCE,
+                    start = context.NearestBullZoneStartTime.ToString("o")
+                },
                 nearest_bear_zone_top = context.NearestBearZoneTop,
                 nearest_bear_zone_bottom = context.NearestBearZoneBottom,
                 nearest_bear_zone_ce = context.NearestBearZoneCE,
+                nearest_bear_zone_start = context.NearestBearZoneStartTime.ToString("o"),
+                bear_roi = new
+                {
+                    top = context.NearestBearZoneTop,
+                    bottom = context.NearestBearZoneBottom,
+                    ce = context.NearestBearZoneCE,
+                    start = context.NearestBearZoneStartTime.ToString("o")
+                },
                 narrative = context.Narrative,
             };
         }
@@ -520,6 +577,7 @@ namespace NinjaTrader.NinjaScript.AddOns
                 Key = snapshotKey,
                 Instrument = GetString(data, "instrument"),
                 Profile = GetString(data, "profile"),
+                ContextTfMinutes = ParseInt(GetString(data, "context_tf_minutes")),
                 PublishedAt = ParseDate(GetString(data, "published_at")),
                 BarTime = ParseDate(GetString(data, "bar_time")),
                 CurrentPrice = ParseDouble(GetString(data, "price")),
@@ -531,6 +589,20 @@ namespace NinjaTrader.NinjaScript.AddOns
                 SetupId = ParseInt(GetString(data, "setup_id")),
                 SetupAgeBars = ParseInt(GetString(data, "setup_age_bars")),
                 FailureReason = GetString(data, "failure_reason"),
+                ChildContextKey = GetString(data, "child_context_key"),
+                ChildTfMinutes = ParseInt(GetString(data, "child_tf_minutes")),
+                ChildBarTime = ParseDate(GetString(data, "child_bar_time")),
+                ChildParentCandleNumber = ParseInt(GetString(data, "child_parent_candle_number")),
+                ChildParentCandleStartTime = ParseDate(GetString(data, "child_parent_candle_start")),
+                ChildParentCandleEndTime = ParseDate(GetString(data, "child_parent_candle_end")),
+                ChildParentCandleHigh = ParseDouble(GetString(data, "child_parent_candle_high")),
+                ChildParentCandleLow = ParseDouble(GetString(data, "child_parent_candle_low")),
+                ChildParentCandleOpen = ParseDouble(GetString(data, "child_parent_candle_open")),
+                ChildParentCandleClose = ParseDouble(GetString(data, "child_parent_candle_close")),
+                IsInsideParentCandleWindow = ParseBool(GetString(data, "is_inside_parent_candle_window")),
+                AiInterfaceVersion = GetString(data, "ai_interface_version"),
+                AiSetupGate = ParseBool(GetString(data, "ai_setup_gate")),
+                AiSetupGateReason = GetString(data, "ai_setup_gate_reason"),
                 SequenceDirection = ParseInt(GetString(data, "sequence_direction")),
                 CurrentCandleNumber = ParseInt(GetString(data, "current_candle_number")),
                 TSpotTouched = ParseBool(GetString(data, "tspot_touched")),
@@ -568,6 +640,16 @@ namespace NinjaTrader.NinjaScript.AddOns
                 C4Open = ParseDouble(GetString(data, "c4_open")),
                 C4Close = ParseDouble(GetString(data, "c4_close")),
                 C4Time = ParseDate(GetString(data, "c4_time")),
+                C5High = ParseDouble(GetString(data, "c5_high")),
+                C5Low = ParseDouble(GetString(data, "c5_low")),
+                C5Open = ParseDouble(GetString(data, "c5_open")),
+                C5Close = ParseDouble(GetString(data, "c5_close")),
+                C5Time = ParseDate(GetString(data, "c5_time")),
+                C6High = ParseDouble(GetString(data, "c6_high")),
+                C6Low = ParseDouble(GetString(data, "c6_low")),
+                C6Open = ParseDouble(GetString(data, "c6_open")),
+                C6Close = ParseDouble(GetString(data, "c6_close")),
+                C6Time = ParseDate(GetString(data, "c6_time")),
                 TSpotUpper = ParseDouble(GetString(data, "t_spot_upper")),
                 TSpotLower = ParseDouble(GetString(data, "t_spot_lower")),
                 ProtectedSwing = ParseDouble(GetString(data, "protected_swing")),
@@ -578,9 +660,11 @@ namespace NinjaTrader.NinjaScript.AddOns
                 NearestBullZoneTop = ParseDouble(GetString(data, "nearest_bull_zone_top")),
                 NearestBullZoneBottom = ParseDouble(GetString(data, "nearest_bull_zone_bottom")),
                 NearestBullZoneCE = ParseDouble(GetString(data, "nearest_bull_zone_ce")),
+                NearestBullZoneStartTime = ParseDate(GetString(data, "nearest_bull_zone_start")),
                 NearestBearZoneTop = ParseDouble(GetString(data, "nearest_bear_zone_top")),
                 NearestBearZoneBottom = ParseDouble(GetString(data, "nearest_bear_zone_bottom")),
                 NearestBearZoneCE = ParseDouble(GetString(data, "nearest_bear_zone_ce")),
+                NearestBearZoneStartTime = ParseDate(GetString(data, "nearest_bear_zone_start")),
                 Narrative = GetString(data, "narrative")
             };
             return true;

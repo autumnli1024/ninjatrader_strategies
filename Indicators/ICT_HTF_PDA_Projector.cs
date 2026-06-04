@@ -19,9 +19,11 @@ namespace NinjaTrader.NinjaScript.Indicators
 		Series<double> NearestBullTop { get; }
 		Series<double> NearestBullBottom { get; }
 		Series<double> NearestBullCE { get; }
+		Series<double> NearestBullStartTimeOa { get; }
 		Series<double> NearestBearTop { get; }
 		Series<double> NearestBearBottom { get; }
 		Series<double> NearestBearCE { get; }
+		Series<double> NearestBearStartTimeOa { get; }
 		Series<double> ActiveBias { get; }
 	}
 
@@ -37,9 +39,11 @@ namespace NinjaTrader.NinjaScript.Indicators
 		private Series<double> nearestBullTop;
 		private Series<double> nearestBullBottom;
 		private Series<double> nearestBullCe;
+		private Series<double> nearestBullStartTimeOa;
 		private Series<double> nearestBearTop;
 		private Series<double> nearestBearBottom;
 		private Series<double> nearestBearCe;
+		private Series<double> nearestBearStartTimeOa;
 		private Series<double> activeBias;
 		private string instanceId;
 		private DateTime lastPrimaryTime = DateTime.MinValue;
@@ -92,9 +96,11 @@ namespace NinjaTrader.NinjaScript.Indicators
 				nearestBullTop = new Series<double>(this);
 				nearestBullBottom = new Series<double>(this);
 				nearestBullCe = new Series<double>(this);
+				nearestBullStartTimeOa = new Series<double>(this);
 				nearestBearTop = new Series<double>(this);
 				nearestBearBottom = new Series<double>(this);
 				nearestBearCe = new Series<double>(this);
+				nearestBearStartTimeOa = new Series<double>(this);
 				activeBias = new Series<double>(this);
 			}
 		}
@@ -282,9 +288,11 @@ namespace NinjaTrader.NinjaScript.Indicators
 			nearestBullTop[0] = bull != null ? bull.Top : double.NaN;
 			nearestBullBottom[0] = bull != null ? bull.Bottom : double.NaN;
 			nearestBullCe[0] = bull != null ? bull.CE : double.NaN;
+			nearestBullStartTimeOa[0] = bull != null ? bull.StartTime.ToOADate() : double.NaN;
 			nearestBearTop[0] = bear != null ? bear.Top : double.NaN;
 			nearestBearBottom[0] = bear != null ? bear.Bottom : double.NaN;
 			nearestBearCe[0] = bear != null ? bear.CE : double.NaN;
+			nearestBearStartTimeOa[0] = bear != null ? bear.StartTime.ToOADate() : double.NaN;
 
 			if (bull != null && bear != null)
 				activeBias[0] = bullDistance <= bearDistance ? 1 : -1;
@@ -422,6 +430,10 @@ namespace NinjaTrader.NinjaScript.Indicators
 
 		[Browsable(false)]
 		[XmlIgnore]
+		public Series<double> NearestBullStartTimeOa { get { return nearestBullStartTimeOa; } }
+
+		[Browsable(false)]
+		[XmlIgnore]
 		public Series<double> NearestBearTop { get { return nearestBearTop; } }
 
 		[Browsable(false)]
@@ -431,6 +443,10 @@ namespace NinjaTrader.NinjaScript.Indicators
 		[Browsable(false)]
 		[XmlIgnore]
 		public Series<double> NearestBearCE { get { return nearestBearCe; } }
+
+		[Browsable(false)]
+		[XmlIgnore]
+		public Series<double> NearestBearStartTimeOa { get { return nearestBearStartTimeOa; } }
 
 		[Browsable(false)]
 		[XmlIgnore]

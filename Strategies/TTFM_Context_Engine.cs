@@ -34,14 +34,22 @@ namespace NinjaTrader.NinjaScript.Strategies
 		private readonly HashSet<string> drawnFractalTags = new HashSet<string>();
 		private bool legacyFractalTagsScrubbed;
 		private int cisdBarsInProgress = -1;
+		private int cisdHtfBarsInProgress = -1;
 		private int cisdConfirmedPrimaryBar = -1;
 		private int cisdConfirmedSeriesBar = -1;
 		private int cisdDirection;
 		private int cisdRunDirection;
 		private double cisdPendingLevel = double.NaN;
+		private int cisdPendingDirection;
+		private double cisdPendingBullLevel = double.NaN;
+		private double cisdPendingBearLevel = double.NaN;
+		private DateTime cisdPendingBullTime = Core.Globals.MinDate;
+		private DateTime cisdPendingBearTime = Core.Globals.MinDate;
 		private double cisdConfirmedLevel = double.NaN;
 		private DateTime cisdPendingTime = Core.Globals.MinDate;
 		private DateTime cisdConfirmedTime = Core.Globals.MinDate;
+		private DateTime cisdLastStoredClosedTime = Core.Globals.MinDate;
+		private readonly List<CisdCandle> cisdHistory = new List<CisdCandle>();
 		private double c1Open = double.NaN, c1High = double.NaN, c1Low = double.NaN, c1Close = double.NaN;
 		private double c2Open = double.NaN, c2High = double.NaN, c2Low = double.NaN, c2Close = double.NaN;
 		private double c3Open = double.NaN, c3High = double.NaN, c3Low = double.NaN, c3Close = double.NaN;
@@ -53,7 +61,7 @@ namespace NinjaTrader.NinjaScript.Strategies
 			{
 				Name = "TTFM_Context_Engine";
 				Description = "TTFM fractal context publisher. Analysis only; no orders.";
-				Calculate = Calculate.OnBarClose;
+				Calculate = Calculate.OnEachTick;
 				EntriesPerDirection = 1;
 				EntryHandling = EntryHandling.AllEntries;
 				IsExitOnSessionCloseStrategy = false;
@@ -102,10 +110,14 @@ namespace NinjaTrader.NinjaScript.Strategies
 			}
 			else if (State == State.Configure)
 			{
+				Calculate = Calculate.OnEachTick;
+
 				if (UseCisd)
 				{
 					AddDataSeries(BarsPeriodType.Minute, Math.Max(1, CisdMinutes));
 					cisdBarsInProgress = 1;
+					AddDataSeries(BarsPeriodType.Minute, Math.Max(Math.Max(1, CisdMinutes), Math.Max(5, HtfPdaProjectorMinutes)));
+					cisdHtfBarsInProgress = 2;
 				}
 			}
 			else if (State == State.DataLoaded)
@@ -159,6 +171,8 @@ namespace NinjaTrader.NinjaScript.Strategies
 				UpdateCisdSeries();
 				return;
 			}
+			if (BarsInProgress == cisdHtfBarsInProgress)
+				return;
 
 			if (BarsInProgress != 0 || CurrentBar < BarsRequiredToTrade || CurrentBar < 3)
 				return;
@@ -204,6 +218,7 @@ namespace NinjaTrader.NinjaScript.Strategies
 			context.Key = ResolveContextKey();
 			context.Instrument = Instrument.FullName;
 			context.Profile = string.IsNullOrWhiteSpace(Profile) ? "D1-H1-M5-M1" : Profile.Trim();
+			context.ContextTfMinutes = BarsPeriod != null ? Math.Max(1, BarsPeriod.Value) : 0;
 			context.PublishedAt = DateTime.Now;
 			context.BarTime = Time[0];
 			context.CurrentPrice = Close[0];
@@ -223,10 +238,9 @@ namespace NinjaTrader.NinjaScript.Strategies
 		{
 			if (fractalStatus == TTFMSetupStatus.Failed)
 			{
-				if (failureBarIndex == CurrentBar)
-					return;
-
 				ResetSetup();
+				DetectC2OnCurrentBar();
+				return;
 			}
 			else if (fractalStatus == TTFMSetupStatus.Completed)
 			{
@@ -317,20 +331,15 @@ namespace NinjaTrader.NinjaScript.Strategies
 				return;
 			}
 
-			bool invalidated = setupDirection > 0 ? Low[0] < c2Low : High[0] > c2High;
+			bool invalidated = IsProtectedSwingBrokenByClosedBar();
 			if (invalidated)
 			{
 				FailSetup("C2 protected swing broken before C3");
 				return;
 			}
 
-			if (age >= Math.Max(1, MaxBarsToWaitC3))
-				FailSetup("C3 not confirmed in wait window");
-			else
-			{
-				fractalStatus = TTFMSetupStatus.WaitingC3;
-				setupPhase = "Waiting C3, age " + age;
-			}
+			fractalStatus = TTFMSetupStatus.WaitingC3;
+			setupPhase = "Waiting C3, age " + age;
 		}
 
 		private void UpdateC4Delivery()
@@ -343,7 +352,10 @@ namespace NinjaTrader.NinjaScript.Strategies
 				return;
 			}
 
-			bool invalidated = setupDirection > 0 ? Low[0] < c2Low : High[0] > c2High;
+			if (TryPromoteC3ToC2OnC4FailedContinuation(age))
+				return;
+
+			bool invalidated = IsProtectedSwingBrokenByClosedBar();
 			if (invalidated)
 			{
 				FailSetup("Protected swing broken");
@@ -357,7 +369,7 @@ namespace NinjaTrader.NinjaScript.Strategies
 				: IsBetween(High[0], c3Low, c3Eq);
 			int candleNumber = Math.Min(6, 3 + age);
 
-			if (age >= 3)
+			if (age > 3)
 			{
 				fractalStatus = TTFMSetupStatus.Completed;
 				setupPhase = "C6 completed";
@@ -366,7 +378,8 @@ namespace NinjaTrader.NinjaScript.Strategies
 
 			if (crossedEq)
 			{
-				FailSetup("T-Spot violated before C6");
+				fractalStatus = TTFMSetupStatus.Paused;
+				setupPhase = "C" + candleNumber + " T-Spot violated";
 			}
 			else
 			{
@@ -380,20 +393,64 @@ namespace NinjaTrader.NinjaScript.Strategies
 			}
 		}
 
+		private bool TryPromoteC3ToC2OnC4FailedContinuation(int age)
+		{
+			if (age != 1 || c2BarIndex < 0 || c3BarIndex < 0)
+				return false;
+
+			bool failedContinuation = IsC4FailedContinuation(setupDirection, High[0], Low[0], c3High, c3Low);
+			if (!failedContinuation)
+				return false;
+
+			c1BarIndex = c2BarIndex;
+			c2BarIndex = c3BarIndex;
+			c3BarIndex = -1;
+			failureBarIndex = -1;
+			failureReason = string.Empty;
+
+			c1Open = c2Open;
+			c1High = c2High;
+			c1Low = c2Low;
+			c1Close = c2Close;
+			c1Time = c2Time;
+
+			c2Open = c3Open;
+			c2High = c3High;
+			c2Low = c3Low;
+			c2Close = c3Close;
+			c2Time = c3Time;
+
+			c3Open = double.NaN;
+			c3High = double.NaN;
+			c3Low = double.NaN;
+			c3Close = double.NaN;
+			c3Time = Core.Globals.MinDate;
+
+			setupId++;
+			fractalStatus = TTFMSetupStatus.WaitingC3;
+			setupPhase = "C4 failed continuation; C3 promoted to C2";
+			return true;
+		}
+
+		private bool IsC4FailedContinuation(int direction, double candidateHigh, double candidateLow, double referenceHigh, double referenceLow)
+		{
+			return direction > 0
+				? candidateLow < referenceLow && candidateHigh <= referenceHigh
+				: candidateHigh > referenceHigh && candidateLow >= referenceLow;
+		}
+
 		private void UpdateCisdSeries()
 		{
 			if (!UseCisd || cisdBarsInProgress < 0)
 				return;
 			if (CurrentBars == null || CurrentBars.Length <= cisdBarsInProgress || CurrentBars[cisdBarsInProgress] < 1)
 				return;
+			if (cisdHtfBarsInProgress >= 0 && (CurrentBars.Length <= cisdHtfBarsInProgress || CurrentBars[cisdHtfBarsInProgress] < 1))
+				return;
 
-			DateTime barTime = Times[cisdBarsInProgress][0];
-
-			double open = Opens[cisdBarsInProgress][0];
-			double high = Highs[cisdBarsInProgress][0];
-			double low = Lows[cisdBarsInProgress][0];
-			double close = Closes[cisdBarsInProgress][0];
-			ProcessCisdCandle(open, high, low, close, barTime);
+			StoreClosedCisdCandle();
+			ConfirmPendingCisdOnClosedCtfBar();
+			UpdateCisdControlFromPine();
 		}
 
 		private void SeedCisdFromPrimaryLookback(int maxBars)
@@ -438,6 +495,223 @@ namespace NinjaTrader.NinjaScript.Strategies
 				return;
 
 			ProcessCisdCandle(Open[0], High[0], Low[0], Close[0], Time[0]);
+		}
+
+		private void StoreClosedCisdCandle()
+		{
+			if (!IsFirstTickOfBar || CurrentBars[cisdBarsInProgress] < 1)
+				return;
+
+			DateTime closedTime = Times[cisdBarsInProgress][1];
+			if (closedTime == cisdLastStoredClosedTime)
+				return;
+
+			CisdCandle candle = new CisdCandle
+			{
+				Open = Opens[cisdBarsInProgress][1],
+				High = Highs[cisdBarsInProgress][1],
+				Low = Lows[cisdBarsInProgress][1],
+				Close = Closes[cisdBarsInProgress][1],
+				Time = closedTime
+			};
+			candle.Direction = GetCandleDirection(candle.Open, candle.High, candle.Low, candle.Close);
+			cisdHistory.Insert(0, candle);
+			while (cisdHistory.Count > 100)
+				cisdHistory.RemoveAt(cisdHistory.Count - 1);
+
+			cisdLastStoredClosedTime = closedTime;
+		}
+
+		private void UpdateCisdControlFromPine()
+		{
+			double mo0 = Opens[cisdBarsInProgress][0];
+			double mh0 = Highs[cisdBarsInProgress][0];
+			double ml0 = Lows[cisdBarsInProgress][0];
+			double mc0 = Closes[cisdBarsInProgress][0];
+			DateTime mt0 = Times[cisdBarsInProgress][0];
+			double mh1 = Highs[cisdBarsInProgress][1];
+			double ml1 = Lows[cisdBarsInProgress][1];
+
+			double htfHigh0 = Highs[cisdHtfBarsInProgress][0];
+			double htfLow0 = Lows[cisdHtfBarsInProgress][0];
+
+			int currentDirection = mc0 > mo0 ? 1 : (mc0 < mo0 ? -1 : 0);
+			int previousDirection = GetCandleDirection(
+				Opens[cisdBarsInProgress][1],
+				Highs[cisdBarsInProgress][1],
+				Lows[cisdBarsInProgress][1],
+				Closes[cisdBarsInProgress][1]);
+
+			if (SamePrice(mh0, htfHigh0) && SamePrice(Highs[cisdBarsInProgress][0], mh0) && mh0 >= mh1)
+				UpdateBearishCisdControl(mo0, mh0, ml0, mc0, mt0, previousDirection, currentDirection);
+
+			if (SamePrice(ml0, htfLow0) && SamePrice(Lows[cisdBarsInProgress][0], ml0) && ml0 <= ml1)
+				UpdateBullishCisdControl(mo0, mh0, ml0, mc0, mt0, previousDirection, currentDirection);
+
+			RefreshSelectedPendingCisd();
+		}
+
+		private void UpdateBearishCisdControl(double open, double high, double low, double close, DateTime time, int previousDirection, int currentDirection)
+		{
+			if (previousDirection <= 0 && currentDirection > 0)
+			{
+				SetPendingCisd(-1, open, time);
+				return;
+			}
+
+			if (previousDirection <= 0 && currentDirection > 0 || cisdHistory.Count <= 15)
+				return;
+
+			for (int i = 1; i <= 15 && i < cisdHistory.Count; i++)
+			{
+				if (cisdHistory[i].High > high)
+					break;
+
+				if (cisdHistory[i].Direction <= 0 && cisdHistory[i - 1].Direction > 0)
+				{
+					int ybar = i - 1;
+					double level = cisdHistory[ybar].Open;
+					DateTime levelTime = cisdHistory[ybar].Time;
+
+					for (int j = ybar; j >= 0; j--)
+					{
+						if (cisdHistory[j].Open < level && cisdHistory[j].Direction > 0)
+						{
+							level = cisdHistory[j].Open;
+							levelTime = cisdHistory[j].Time;
+						}
+					}
+
+					if (level > open && !(close < open))
+					{
+						level = open;
+						levelTime = time;
+					}
+					if (level > open && close < open)
+					{
+						level = low;
+						levelTime = time;
+					}
+
+					SetPendingCisd(-1, level, levelTime);
+					break;
+				}
+			}
+		}
+
+		private void UpdateBullishCisdControl(double open, double high, double low, double close, DateTime time, int previousDirection, int currentDirection)
+		{
+			if (previousDirection >= 0 && currentDirection < 0)
+			{
+				SetPendingCisd(1, open, time);
+				return;
+			}
+
+			if (previousDirection >= 0 && currentDirection < 0 || cisdHistory.Count <= 15)
+				return;
+
+			for (int i = 1; i <= 15 && i < cisdHistory.Count; i++)
+			{
+				if (cisdHistory[i].Low < low)
+					break;
+
+				if (cisdHistory[i].Direction >= 0 && cisdHistory[i - 1].Direction < 0)
+				{
+					int xbar = i - 1;
+					double level = cisdHistory[xbar].Open;
+					DateTime levelTime = cisdHistory[xbar].Time;
+
+					for (int j = xbar; j >= 0; j--)
+					{
+						if (cisdHistory[j].Open > level && cisdHistory[j].Direction < 0)
+						{
+							level = cisdHistory[j].Open;
+							levelTime = cisdHistory[j].Time;
+						}
+					}
+
+					if (level < open && !(close > open))
+					{
+						level = open;
+						levelTime = time;
+					}
+					if (level < open && close > open)
+					{
+						level = high;
+						levelTime = time;
+					}
+
+					SetPendingCisd(1, level, levelTime);
+					break;
+				}
+			}
+		}
+
+		private void SetPendingCisd(int direction, double level, DateTime time)
+		{
+			if (!IsValidPrice(level) || time == Core.Globals.MinDate)
+				return;
+
+			if (direction > 0)
+			{
+				cisdPendingBullLevel = level;
+				cisdPendingBullTime = time;
+			}
+			else if (direction < 0)
+			{
+				cisdPendingBearLevel = level;
+				cisdPendingBearTime = time;
+			}
+		}
+
+		private void RefreshSelectedPendingCisd()
+		{
+			bool hasBull = IsValidPrice(cisdPendingBullLevel) && cisdPendingBullTime != Core.Globals.MinDate;
+			bool hasBear = IsValidPrice(cisdPendingBearLevel) && cisdPendingBearTime != Core.Globals.MinDate;
+
+			if (hasBull && (!hasBear || cisdPendingBullTime >= cisdPendingBearTime))
+			{
+				cisdPendingDirection = 1;
+				cisdPendingLevel = cisdPendingBullLevel;
+				cisdPendingTime = cisdPendingBullTime;
+			}
+			else if (hasBear)
+			{
+				cisdPendingDirection = -1;
+				cisdPendingLevel = cisdPendingBearLevel;
+				cisdPendingTime = cisdPendingBearTime;
+			}
+			else
+			{
+				cisdPendingDirection = 0;
+				cisdPendingLevel = double.NaN;
+				cisdPendingTime = Core.Globals.MinDate;
+			}
+		}
+
+		private void ConfirmPendingCisdOnClosedCtfBar()
+		{
+			if (!IsFirstTickOfBar || CurrentBars[cisdBarsInProgress] < 1)
+				return;
+
+			double closedClose = Closes[cisdBarsInProgress][1];
+			DateTime closedTime = Times[cisdBarsInProgress][1];
+
+			if (IsValidPrice(cisdPendingBullLevel) && cisdPendingBullTime != Core.Globals.MinDate && closedTime > cisdPendingBullTime && closedClose > cisdPendingBullLevel)
+			{
+				ConfirmCisd(1, cisdPendingBullLevel, closedTime);
+				cisdPendingBullLevel = double.NaN;
+				cisdPendingBullTime = Core.Globals.MinDate;
+			}
+
+			if (IsValidPrice(cisdPendingBearLevel) && cisdPendingBearTime != Core.Globals.MinDate && closedTime > cisdPendingBearTime && closedClose < cisdPendingBearLevel)
+			{
+				ConfirmCisd(-1, cisdPendingBearLevel, closedTime);
+				cisdPendingBearLevel = double.NaN;
+				cisdPendingBearTime = Core.Globals.MinDate;
+			}
+
+			RefreshSelectedPendingCisd();
 		}
 
 		private void ProcessCisdCandle(double open, double high, double low, double close, DateTime barTime)
@@ -550,22 +824,33 @@ namespace NinjaTrader.NinjaScript.Strategies
 			cisdConfirmedSeriesBar = -1;
 			cisdDirection = 0;
 			cisdRunDirection = 0;
+			cisdPendingDirection = 0;
 			cisdPendingLevel = double.NaN;
+			cisdPendingBullLevel = double.NaN;
+			cisdPendingBearLevel = double.NaN;
 			cisdConfirmedLevel = double.NaN;
 			cisdPendingTime = Core.Globals.MinDate;
+			cisdPendingBullTime = Core.Globals.MinDate;
+			cisdPendingBearTime = Core.Globals.MinDate;
 			cisdConfirmedTime = Core.Globals.MinDate;
+			cisdLastStoredClosedTime = Core.Globals.MinDate;
+			cisdHistory.Clear();
 			RemoveDrawObject("TTFM_CISD");
 			RemoveDrawObject("TTFM_CISD_LABEL");
 		}
 
 		private void PopulateCandlesFromState(TTFM_Context context)
 		{
+			if (c3BarIndex == CurrentBar)
+				LockCandle(0, out c3Open, out c3High, out c3Low, out c3Close, out c3Time);
+
 			context.SetupId = setupId;
 			context.SetupStatus = fractalStatus;
 			context.SetupPhase = setupPhase;
 			context.SetupAgeBars = c3BarIndex >= 0 ? CurrentBar - c3BarIndex : (c2BarIndex >= 0 ? CurrentBar - c2BarIndex : 0);
 			context.FailureReason = failureReason;
 			context.Bias = ExternalBias != 0 ? ExternalBias : setupDirection;
+			context.SequenceDirection = setupDirection;
 
 			context.C1High = c1High;
 			context.C1Low = c1Low;
@@ -586,11 +871,154 @@ namespace NinjaTrader.NinjaScript.Strategies
 			context.C3Eq = IsValidPrice(c3High) && IsValidPrice(c3Low) ? (c3High + c3Low) * 0.5 : double.NaN;
 			context.C3Time = c3Time;
 
-			context.C4High = High[0];
-			context.C4Low = Low[0];
-			context.C4Open = Open[0];
-			context.C4Close = Close[0];
-			context.C4Time = Time[0];
+			PopulatePostC3CandlesFromActiveState(context);
+
+			if (c2BarIndex < 0)
+				PopulateCandlesFromScannedSequence(context);
+		}
+
+		private void PopulateCandlesFromScannedSequence(TTFM_Context context)
+		{
+			int direction;
+			int c2BarsAgo;
+			int c3BarsAgo;
+			if (!FindLatestActiveScannedSequence(out direction, out c2BarsAgo, out c3BarsAgo))
+				return;
+
+			int c1BarsAgo = c2BarsAgo + 1;
+			if (c1BarsAgo > CurrentBar)
+				return;
+
+			context.SequenceDirection = direction;
+			context.Bias = ExternalBias != 0 ? ExternalBias : direction;
+			context.SetupStatus = TTFMSetupStatus.Valid;
+			context.SetupPhase = direction > 0 ? "Bullish scanned C3 active" : "Bearish scanned C3 active";
+			context.SetupAgeBars = c3BarsAgo;
+
+			PopulateContextCandle(context, c1BarsAgo, 1);
+			PopulateContextCandle(context, c2BarsAgo, 2);
+			PopulateContextCandle(context, c3BarsAgo, 3);
+
+			context.C3Eq = IsValidPrice(context.C3High) && IsValidPrice(context.C3Low) ? (context.C3High + context.C3Low) * 0.5 : double.NaN;
+			PopulatePostC3CandlesFromScannedSequence(context, c3BarsAgo);
+		}
+
+		private void PopulatePostC3CandlesFromActiveState(TTFM_Context context)
+		{
+			ClearContextCandle(context, 4);
+			ClearContextCandle(context, 5);
+			ClearContextCandle(context, 6);
+
+			if (c3BarIndex < 0)
+				return;
+
+			for (int candleNumber = 4; candleNumber <= 6; candleNumber++)
+			{
+				int barIndex = c3BarIndex + (candleNumber - 3);
+				if (CurrentBar < barIndex)
+					continue;
+
+				PopulateContextCandle(context, CurrentBar - barIndex, candleNumber);
+			}
+		}
+
+		private void PopulatePostC3CandlesFromScannedSequence(TTFM_Context context, int c3BarsAgo)
+		{
+			ClearContextCandle(context, 4);
+			ClearContextCandle(context, 5);
+			ClearContextCandle(context, 6);
+
+			for (int candleNumber = 4; candleNumber <= 6; candleNumber++)
+			{
+				int barsAgo = c3BarsAgo - (candleNumber - 3);
+				if (barsAgo < 0 || barsAgo > CurrentBar)
+					continue;
+
+				PopulateContextCandle(context, barsAgo, candleNumber);
+			}
+		}
+
+		private void PopulateContextCandle(TTFM_Context context, int barsAgo, int candleNumber)
+		{
+			if (barsAgo < 0 || barsAgo > CurrentBar)
+				return;
+
+			if (candleNumber == 1)
+			{
+				context.C1High = High[barsAgo];
+				context.C1Low = Low[barsAgo];
+				context.C1Open = Open[barsAgo];
+				context.C1Close = Close[barsAgo];
+				context.C1Time = Time[barsAgo];
+			}
+			else if (candleNumber == 2)
+			{
+				context.C2High = High[barsAgo];
+				context.C2Low = Low[barsAgo];
+				context.C2Open = Open[barsAgo];
+				context.C2Close = Close[barsAgo];
+				context.C2Time = Time[barsAgo];
+			}
+			else if (candleNumber == 3)
+			{
+				context.C3High = High[barsAgo];
+				context.C3Low = Low[barsAgo];
+				context.C3Open = Open[barsAgo];
+				context.C3Close = Close[barsAgo];
+				context.C3Time = Time[barsAgo];
+			}
+			else if (candleNumber == 4)
+			{
+				context.C4High = High[barsAgo];
+				context.C4Low = Low[barsAgo];
+				context.C4Open = Open[barsAgo];
+				context.C4Close = Close[barsAgo];
+				context.C4Time = Time[barsAgo];
+			}
+			else if (candleNumber == 5)
+			{
+				context.C5High = High[barsAgo];
+				context.C5Low = Low[barsAgo];
+				context.C5Open = Open[barsAgo];
+				context.C5Close = Close[barsAgo];
+				context.C5Time = Time[barsAgo];
+			}
+			else if (candleNumber == 6)
+			{
+				context.C6High = High[barsAgo];
+				context.C6Low = Low[barsAgo];
+				context.C6Open = Open[barsAgo];
+				context.C6Close = Close[barsAgo];
+				context.C6Time = Time[barsAgo];
+			}
+		}
+
+		private void ClearContextCandle(TTFM_Context context, int candleNumber)
+		{
+			if (candleNumber == 4)
+			{
+				context.C4High = double.NaN;
+				context.C4Low = double.NaN;
+				context.C4Open = double.NaN;
+				context.C4Close = double.NaN;
+				context.C4Time = Core.Globals.MinDate;
+			}
+			else if (candleNumber == 5)
+			{
+				context.C5High = double.NaN;
+				context.C5Low = double.NaN;
+				context.C5Open = double.NaN;
+				context.C5Close = double.NaN;
+				context.C5Time = Core.Globals.MinDate;
+			}
+			else if (candleNumber == 6)
+			{
+				context.C6High = double.NaN;
+				context.C6Low = double.NaN;
+				context.C6Open = double.NaN;
+				context.C6Close = double.NaN;
+				context.C6Time = Core.Globals.MinDate;
+			}
 		}
 
 		private void DetermineBias(TTFM_Context context)
@@ -634,12 +1062,10 @@ namespace NinjaTrader.NinjaScript.Strategies
 			if (barsAgo + 1 > CurrentBar)
 				return false;
 
-			bool sweptLow = Low[barsAgo] < Low[barsAgo + 1];
-			bool sweptHigh = High[barsAgo] > High[barsAgo + 1];
-			if (sweptLow == sweptHigh)
-				return false;
-
-			return sweptLow && Close[barsAgo] > Low[barsAgo + 1];
+			bool previousBearish = Close[barsAgo + 1] < Open[barsAgo + 1];
+			return previousBearish
+				&& Low[barsAgo] < Low[barsAgo + 1]
+				&& Close[barsAgo] > Low[barsAgo + 1];
 		}
 
 		private bool IsBearishC2At(int barsAgo)
@@ -647,12 +1073,10 @@ namespace NinjaTrader.NinjaScript.Strategies
 			if (barsAgo + 1 > CurrentBar)
 				return false;
 
-			bool sweptHigh = High[barsAgo] > High[barsAgo + 1];
-			bool sweptLow = Low[barsAgo] < Low[barsAgo + 1];
-			if (sweptHigh == sweptLow)
-				return false;
-
-			return sweptHigh && Close[barsAgo] < High[barsAgo + 1];
+			bool previousBullish = Close[barsAgo + 1] > Open[barsAgo + 1];
+			return previousBullish
+				&& High[barsAgo] > High[barsAgo + 1]
+				&& Close[barsAgo] < High[barsAgo + 1];
 		}
 
 		private bool IsBullExpansion(double c2LowValue, double c2HighValue, double currentLow, double currentClose, bool strictClose)
@@ -663,6 +1087,21 @@ namespace NinjaTrader.NinjaScript.Strategies
 		private bool IsBearExpansion(double c2LowValue, double c2HighValue, double currentHigh, double currentClose, bool strictClose)
 		{
 			return currentHigh < c2HighValue && (strictClose ? currentClose < c2LowValue : currentClose < (c2HighValue + c2LowValue) * 0.5);
+		}
+
+		private bool IsProtectedSwingBrokenByClosedBar()
+		{
+			if (!IsFirstTickOfBar || c2BarIndex < 0 || CurrentBar <= c2BarIndex)
+				return false;
+
+			int closedBarsAgo = 1;
+			int closedBarIndex = CurrentBar - closedBarsAgo;
+			if (closedBarIndex <= c2BarIndex)
+				return false;
+
+			return setupDirection > 0
+				? Low[closedBarsAgo] < c2Low
+				: High[closedBarsAgo] > c2High;
 		}
 
 		private void FailSetup(string reason)
@@ -691,45 +1130,76 @@ namespace NinjaTrader.NinjaScript.Strategies
 
 		private void ComputeTSpot(TTFM_Context context)
 		{
-			if (setupDirection > 0 && IsValidPrice(context.C3Eq))
+			int direction = context.SequenceDirection != 0 ? context.SequenceDirection : setupDirection;
+
+			if (direction > 0 && IsValidPrice(context.C2Low))
 			{
-				context.TSpotLower = context.C3Eq;
-				context.TSpotUpper = context.C3High;
 				context.ProtectedSwing = context.C2Low;
 				context.InvalidationPrice = context.C2Low;
 			}
-			else if (setupDirection < 0 && IsValidPrice(context.C3Eq))
+			else if (direction < 0 && IsValidPrice(context.C2High))
+			{
+				context.ProtectedSwing = context.C2High;
+				context.InvalidationPrice = context.C2High;
+			}
+
+			if (direction > 0 && IsValidPrice(context.C3Eq))
+			{
+				context.TSpotLower = context.C3Eq;
+				context.TSpotUpper = context.C3High;
+			}
+			else if (direction < 0 && IsValidPrice(context.C3Eq))
 			{
 				context.TSpotLower = context.C3Low;
 				context.TSpotUpper = context.C3Eq;
-				context.ProtectedSwing = context.C2High;
-				context.InvalidationPrice = context.C2High;
 			}
 		}
 
 		private void ComputeSequenceFacts(TTFM_Context context)
 		{
-			context.SequenceDirection = setupDirection;
-			context.CurrentCandleNumber = c3BarIndex >= 0 ? Math.Min(6, Math.Max(3, 3 + (CurrentBar - c3BarIndex))) : (c2BarIndex >= 0 ? 2 : 0);
+			int direction = context.SequenceDirection != 0 ? context.SequenceDirection : setupDirection;
+			if (context.SequenceDirection == 0)
+				context.SequenceDirection = setupDirection;
+			context.CurrentCandleNumber = c3BarIndex >= 0
+				? Math.Min(6, Math.Max(3, 3 + (CurrentBar - c3BarIndex)))
+				: (c2BarIndex >= 0
+					? 2
+					: (context.C3Time != Core.Globals.MinDate
+						? Math.Min(6, Math.Max(3, 3 + context.SetupAgeBars))
+						: (context.C2Time != Core.Globals.MinDate ? 2 : 0)));
 
-			if (!IsValidPrice(context.TSpotLower) || !IsValidPrice(context.TSpotUpper) || setupDirection == 0)
+			if (direction == 0)
 			{
 				context.TSpotTouched = false;
-			context.TSpotViolated = false;
-			context.ProtectedSwingBroken = false;
-			context.DistanceToTSpotTicks = double.NaN;
-			context.DistanceToProtectedTicks = double.NaN;
-			PopulateCisdFacts(context);
-			return;
+				context.TSpotViolated = false;
+				context.ProtectedSwingBroken = false;
+				context.DistanceToTSpotTicks = double.NaN;
+				context.DistanceToProtectedTicks = double.NaN;
+				PopulateCisdFacts(context);
+				return;
 			}
 
-			context.TSpotTouched = setupDirection > 0
+			if (!IsValidPrice(context.TSpotLower) || !IsValidPrice(context.TSpotUpper))
+			{
+				context.TSpotTouched = false;
+				context.TSpotViolated = false;
+				context.ProtectedSwingBroken = IsValidPrice(context.ProtectedSwing)
+					&& (direction > 0 ? Low[0] < context.ProtectedSwing : High[0] > context.ProtectedSwing);
+				context.DistanceToTSpotTicks = double.NaN;
+				context.DistanceToProtectedTicks = IsValidPrice(context.ProtectedSwing)
+					? (direction > 0 ? context.CurrentPrice - context.ProtectedSwing : context.ProtectedSwing - context.CurrentPrice) / TickSize
+					: double.NaN;
+				PopulateCisdFacts(context);
+				return;
+			}
+
+			context.TSpotTouched = direction > 0
 				? IsBetween(context.C4Low, context.TSpotLower, context.TSpotUpper)
 				: IsBetween(context.C4High, context.TSpotLower, context.TSpotUpper);
-			context.TSpotViolated = setupDirection > 0
+			context.TSpotViolated = direction > 0
 				? context.C4Low < context.TSpotLower
 				: context.C4High > context.TSpotUpper;
-			context.ProtectedSwingBroken = setupDirection > 0
+			context.ProtectedSwingBroken = direction > 0
 				? context.C4Low < context.ProtectedSwing
 				: context.C4High > context.ProtectedSwing;
 
@@ -740,7 +1210,7 @@ namespace NinjaTrader.NinjaScript.Strategies
 				tspotDistance = context.CurrentPrice - context.TSpotUpper;
 			context.DistanceToTSpotTicks = tspotDistance / TickSize;
 
-			double protectedDistance = setupDirection > 0
+			double protectedDistance = direction > 0
 				? context.CurrentPrice - context.ProtectedSwing
 				: context.ProtectedSwing - context.CurrentPrice;
 			context.DistanceToProtectedTicks = protectedDistance / TickSize;
@@ -753,7 +1223,7 @@ namespace NinjaTrader.NinjaScript.Strategies
 			context.CisdMinutes = UseCisd ? Math.Max(1, CisdMinutes) : 0;
 			bool hasNewerPending = IsValidPrice(cisdPendingLevel) && cisdPendingTime != Core.Globals.MinDate && cisdPendingTime > cisdConfirmedTime;
 			context.CisdConfirmed = cisdDirection != 0 && IsValidPrice(cisdConfirmedLevel) && !hasNewerPending;
-			context.CisdDirection = context.CisdConfirmed ? cisdDirection : (cisdRunDirection != 0 ? -cisdRunDirection : 0);
+			context.CisdDirection = context.CisdConfirmed ? cisdDirection : cisdPendingDirection;
 			context.CisdLevel = context.CisdConfirmed ? cisdConfirmedLevel : cisdPendingLevel;
 			context.CisdTime = context.CisdConfirmed ? cisdConfirmedTime : cisdPendingTime;
 			context.CisdAgeBars = context.CisdConfirmed && cisdConfirmedPrimaryBar >= 0 ? Math.Max(0, CurrentBar - cisdConfirmedPrimaryBar) : 0;
@@ -762,7 +1232,8 @@ namespace NinjaTrader.NinjaScript.Strategies
 
 		private void ScoreAndState(TTFM_Context context)
 		{
-			if (setupDirection == 0)
+			int direction = context.SequenceDirection != 0 ? context.SequenceDirection : setupDirection;
+			if (direction == 0)
 			{
 				context.SetupStatus = TTFMSetupStatus.Forming;
 				context.AllowedDirection = ICTContextDirection.None;
@@ -772,17 +1243,20 @@ namespace NinjaTrader.NinjaScript.Strategies
 				return;
 			}
 
-			context.SetupStatus = fractalStatus;
-			context.SetupPhase = setupPhase;
+			if (setupDirection != 0)
+			{
+				context.SetupStatus = fractalStatus;
+				context.SetupPhase = setupPhase;
+			}
 			context.FailureReason = failureReason;
-			context.Location = setupDirection > 0 ? "Bullish TTFM" : "Bearish TTFM";
+			context.Location = direction > 0 ? "Bullish TTFM" : "Bearish TTFM";
 
-			bool hasC3 = c3BarIndex >= 0 && IsValidPrice(context.C3Eq);
+			bool hasC3 = IsValidPrice(context.C3Eq) && context.C3Time != Core.Globals.MinDate;
 			bool displacement = hasC3 && Math.Abs(context.C3Close - context.C3Open) >= Math.Max(TickSize, MinDisplacementBodyTicks * TickSize);
-			bool touchedTSpot = hasC3 && (setupDirection > 0
+			bool touchedTSpot = hasC3 && (direction > 0
 				? IsBetween(context.C4Low, context.TSpotLower, context.TSpotUpper)
 				: IsBetween(context.C4High, context.TSpotLower, context.TSpotUpper));
-			bool respectedTSpot = hasC3 && (setupDirection > 0 ? context.C4Low >= context.TSpotLower : context.C4High <= context.TSpotUpper);
+			bool respectedTSpot = hasC3 && (direction > 0 ? context.C4Low >= context.TSpotLower : context.C4High <= context.TSpotUpper);
 
 			int confidence = hasC3 ? 45 : 25;
 			if (hasC3) confidence += 20;
@@ -793,24 +1267,25 @@ namespace NinjaTrader.NinjaScript.Strategies
 			if (HasDirectionalPda(context)) confidence += 10;
 			context.Confidence = Math.Min(100, confidence);
 
-			if (ExternalBias != 0 && ExternalBias != setupDirection)
+			if (ExternalBias != 0 && ExternalBias != direction)
 				context.AllowedDirection = ICTContextDirection.None;
 			else if (context.SetupStatus == TTFMSetupStatus.Valid)
-				context.AllowedDirection = setupDirection > 0 ? ICTContextDirection.LongOnly : ICTContextDirection.ShortOnly;
+				context.AllowedDirection = direction > 0 ? ICTContextDirection.LongOnly : ICTContextDirection.ShortOnly;
 			else if (context.SetupStatus == TTFMSetupStatus.Paused)
 				context.AllowedDirection = ICTContextDirection.Both;
 			else
 				context.AllowedDirection = ICTContextDirection.None;
 
 			if (hasC3)
-				context.Location = setupDirection > 0 ? "Bullish T-Spot" : "Bearish T-Spot";
+				context.Location = direction > 0 ? "Bullish T-Spot" : "Bearish T-Spot";
 		}
 
 		private bool HasDirectionalPda(TTFM_Context context)
 		{
-			if (setupDirection > 0)
+			int direction = context.SequenceDirection != 0 ? context.SequenceDirection : setupDirection;
+			if (direction > 0)
 				return IsValidPrice(context.NearestBullZoneTop) && IsValidPrice(context.NearestBullZoneBottom);
-			if (setupDirection < 0)
+			if (direction < 0)
 				return IsValidPrice(context.NearestBearZoneTop) && IsValidPrice(context.NearestBearZoneBottom);
 			return false;
 		}
@@ -828,21 +1303,25 @@ namespace NinjaTrader.NinjaScript.Strategies
 			double bullTop = SafeSeriesValue(htfPdaProjector.NearestBullTop, 0);
 			double bullBottom = SafeSeriesValue(htfPdaProjector.NearestBullBottom, 0);
 			double bullCe = SafeSeriesValue(htfPdaProjector.NearestBullCE, 0);
+			DateTime bullStart = SafeOaDateSeriesValue(htfPdaProjector.NearestBullStartTimeOa, 0);
 			if (IsValidPrice(bullTop) && IsValidPrice(bullBottom))
 			{
 				context.NearestBullZoneTop = Math.Max(bullTop, bullBottom);
 				context.NearestBullZoneBottom = Math.Min(bullTop, bullBottom);
 				context.NearestBullZoneCE = bullCe;
+				context.NearestBullZoneStartTime = bullStart;
 			}
 
 			double bearTop = SafeSeriesValue(htfPdaProjector.NearestBearTop, 0);
 			double bearBottom = SafeSeriesValue(htfPdaProjector.NearestBearBottom, 0);
 			double bearCe = SafeSeriesValue(htfPdaProjector.NearestBearCE, 0);
+			DateTime bearStart = SafeOaDateSeriesValue(htfPdaProjector.NearestBearStartTimeOa, 0);
 			if (IsValidPrice(bearTop) && IsValidPrice(bearBottom))
 			{
 				context.NearestBearZoneTop = Math.Max(bearTop, bearBottom);
 				context.NearestBearZoneBottom = Math.Min(bearTop, bearBottom);
 				context.NearestBearZoneCE = bearCe;
+				context.NearestBearZoneStartTime = bearStart;
 			}
 		}
 
@@ -865,6 +1344,7 @@ namespace NinjaTrader.NinjaScript.Strategies
 						context.NearestBullZoneTop = Math.Max(top, bottom);
 						context.NearestBullZoneBottom = Math.Min(top, bottom);
 						context.NearestBullZoneCE = (context.NearestBullZoneTop + context.NearestBullZoneBottom) * 0.5;
+						context.NearestBullZoneStartTime = Time[barsAgo + 2];
 						if (string.IsNullOrWhiteSpace(context.RoiSource))
 						{
 							context.RoiSource = "Local_H1_FVG_Fallback";
@@ -885,6 +1365,7 @@ namespace NinjaTrader.NinjaScript.Strategies
 						context.NearestBearZoneTop = Math.Max(top, bottom);
 						context.NearestBearZoneBottom = Math.Min(top, bottom);
 						context.NearestBearZoneCE = (context.NearestBearZoneTop + context.NearestBearZoneBottom) * 0.5;
+						context.NearestBearZoneStartTime = Time[barsAgo + 2];
 						if (string.IsNullOrWhiteSpace(context.RoiSource))
 						{
 							context.RoiSource = "Local_H1_FVG_Fallback";
@@ -925,6 +1406,21 @@ namespace NinjaTrader.NinjaScript.Strategies
 			}
 		}
 
+		private DateTime SafeOaDateSeriesValue(Series<double> series, int barsAgo)
+		{
+			double value = SafeRawSeriesValue(series, barsAgo);
+			if (double.IsNaN(value) || double.IsInfinity(value) || value <= 0)
+				return Core.Globals.MinDate;
+			try
+			{
+				return DateTime.FromOADate(value);
+			}
+			catch
+			{
+				return Core.Globals.MinDate;
+			}
+		}
+
 		private void BuildNarrative(TTFM_Context context)
 		{
 			string bias = context.Bias > 0 ? "Bullish" : (context.Bias < 0 ? "Bearish" : "Neutral");
@@ -960,48 +1456,115 @@ namespace NinjaTrader.NinjaScript.Strategies
 				"C2 H/L: " + FormatPrice(context.C2High) + " / " + FormatPrice(context.C2Low) + "\n" +
 				"C3 H/EQ/L: " + FormatPrice(context.C3High) + " / " + FormatPrice(context.C3Eq) + " / " + FormatPrice(context.C3Low) + "\n" +
 				"C4 H/L/C: " + FormatPrice(context.C4High) + " / " + FormatPrice(context.C4Low) + " / " + FormatPrice(context.C4Close) + "\n" +
+				"C5 H/L/C: " + FormatPrice(context.C5High) + " / " + FormatPrice(context.C5Low) + " / " + FormatPrice(context.C5Close) + "\n" +
+				"C6 H/L/C: " + FormatPrice(context.C6High) + " / " + FormatPrice(context.C6Low) + " / " + FormatPrice(context.C6Close) + "\n" +
 				"T-Spot: " + FormatZone(context.TSpotUpper, context.TSpotLower) + "\n" +
 				"Protected/Invalid: " + FormatPrice(context.ProtectedSwing) + " / " + FormatPrice(context.InvalidationPrice) + "\n" +
 				"ROI: " + context.RoiSource + " " + context.RoiHtfMinutes + "m bias " + context.RoiActiveBias + "\n" +
-				"Bull ROI: " + FormatZone(context.NearestBullZoneTop, context.NearestBullZoneBottom) + " CE " + FormatPrice(context.NearestBullZoneCE) + "\n" +
-				"Bear ROI: " + FormatZone(context.NearestBearZoneTop, context.NearestBearZoneBottom) + " CE " + FormatPrice(context.NearestBearZoneCE);
+				"Bull ROI: " + FormatZone(context.NearestBullZoneTop, context.NearestBullZoneBottom) + " CE " + FormatPrice(context.NearestBullZoneCE) + " @ " + FormatTime(context.NearestBullZoneStartTime) + "\n" +
+				"Bear ROI: " + FormatZone(context.NearestBearZoneTop, context.NearestBearZoneBottom) + " CE " + FormatPrice(context.NearestBearZoneCE) + " @ " + FormatTime(context.NearestBearZoneStartTime);
 
 			Draw.TextFixed(this, "TTFM_CONTEXT_PANEL", text, TextPosition.TopLeft, Brushes.WhiteSmoke, new SimpleFont("Consolas", 12), Brushes.DimGray, Brushes.Black, 80);
 		}
 
 		private void DrawCisd(TTFM_Context context)
 		{
-			if (!UseCisd || !IsValidPrice(context.CisdLevel) || context.CisdTime == Core.Globals.MinDate)
+			if (!UseCisd)
 			{
 				RemoveCisdDrawObjects();
 				return;
 			}
 
-			int direction = context.CisdDirection;
-			if (direction == 0)
+			TimeSpan span = TimeSpan.FromMinutes(Math.Max(1, CisdMinutes) * Math.Max(1, CisdLineProjectionBars));
+			DateTime endTime = Time[0].Add(span);
+			bool drew = false;
+
+			if (cisdDirection != 0 && IsValidPrice(cisdConfirmedLevel) && cisdConfirmedTime != Core.Globals.MinDate)
 			{
-				RemoveCisdDrawObjects();
-				return;
+				DrawSingleCisdLine(
+					"TTFM_CISD_CONFIRMED",
+					"TTFM_CISD_CONFIRMED_LABEL",
+					cisdDirection,
+					cisdConfirmedLevel,
+					cisdConfirmedTime,
+					endTime,
+					true);
+				drew = true;
 			}
+			else
+			{
+				RemoveDrawObject("TTFM_CISD_CONFIRMED");
+				RemoveDrawObject("TTFM_CISD_CONFIRMED_LABEL");
+			}
+
+			if (IsValidPrice(cisdPendingBullLevel) && cisdPendingBullTime != Core.Globals.MinDate)
+			{
+				DrawSingleCisdLine(
+					"TTFM_CISD_PENDING_BULL",
+					"TTFM_CISD_PENDING_BULL_LABEL",
+					1,
+					cisdPendingBullLevel,
+					cisdPendingBullTime,
+					endTime,
+					false);
+				drew = true;
+			}
+			else
+			{
+				RemoveDrawObject("TTFM_CISD_PENDING_BULL");
+				RemoveDrawObject("TTFM_CISD_PENDING_BULL_LABEL");
+			}
+
+			if (IsValidPrice(cisdPendingBearLevel) && cisdPendingBearTime != Core.Globals.MinDate)
+			{
+				DrawSingleCisdLine(
+					"TTFM_CISD_PENDING_BEAR",
+					"TTFM_CISD_PENDING_BEAR_LABEL",
+					-1,
+					cisdPendingBearLevel,
+					cisdPendingBearTime,
+					endTime,
+					false);
+				drew = true;
+			}
+			else
+			{
+				RemoveDrawObject("TTFM_CISD_PENDING_BEAR");
+				RemoveDrawObject("TTFM_CISD_PENDING_BEAR_LABEL");
+			}
+
+			RemoveDrawObject("TTFM_CISD");
+			RemoveDrawObject("TTFM_CISD_LABEL");
+
+			if (!drew)
+				RemoveCisdDrawObjects();
+		}
+
+		private void DrawSingleCisdLine(string lineTag, string labelTag, int direction, double level, DateTime startTime, DateTime endTime, bool confirmed)
+		{
 			Brush confirmedBrush = direction > 0
 				? (BullCisdBrush ?? Brushes.Blue)
 				: (BearCisdBrush ?? Brushes.Red);
-			Brush lineBrush = context.CisdConfirmed ? confirmedBrush : (PendingCisdLineBrush ?? Brushes.Gray);
-			Brush textBrush = context.CisdConfirmed ? confirmedBrush : (PendingCisdTextBrush ?? Brushes.Black);
-			TimeSpan span = TimeSpan.FromMinutes(Math.Max(1, CisdMinutes) * Math.Max(1, CisdLineProjectionBars));
-			DateTime endTime = Time[0].Add(span);
-			string text = (context.CisdConfirmed ? "CISD" : "pending CISD") + (direction > 0 ? "+" : "-") + " " + Math.Max(1, CisdMinutes) + "m";
-			DashStyleHelper style = context.CisdConfirmed ? DashStyleHelper.Solid : DashStyleHelper.Dash;
-			int width = context.CisdConfirmed ? Math.Max(1, ConfirmedCisdLineWidth) : Math.Max(1, PendingCisdLineWidth);
+			Brush lineBrush = confirmed ? confirmedBrush : (PendingCisdLineBrush ?? Brushes.Gray);
+			Brush textBrush = confirmed ? confirmedBrush : (PendingCisdTextBrush ?? Brushes.Black);
+			string text = (confirmed ? "CISD" : "pending CISD") + (direction > 0 ? "+" : "-") + " " + Math.Max(1, CisdMinutes) + "m";
+			DashStyleHelper style = confirmed ? DashStyleHelper.Solid : DashStyleHelper.Dash;
+			int width = confirmed ? Math.Max(1, ConfirmedCisdLineWidth) : Math.Max(1, PendingCisdLineWidth);
 
-			Draw.Line(this, "TTFM_CISD", false, context.CisdTime, context.CisdLevel, endTime, context.CisdLevel, lineBrush, style, width);
-			Draw.Text(this, "TTFM_CISD_LABEL", false, text, endTime, context.CisdLevel, 0, textBrush, new SimpleFont("Arial", 10), TextAlignment.Left, Brushes.Transparent, Brushes.Transparent, 0);
+			Draw.Line(this, lineTag, false, startTime, level, endTime, level, lineBrush, style, width);
+			Draw.Text(this, labelTag, false, text, endTime, level, 0, textBrush, new SimpleFont("Arial", 10), TextAlignment.Left, Brushes.Transparent, Brushes.Transparent, 0);
 		}
 
 		private void RemoveCisdDrawObjects()
 		{
 			RemoveDrawObject("TTFM_CISD");
 			RemoveDrawObject("TTFM_CISD_LABEL");
+			RemoveDrawObject("TTFM_CISD_CONFIRMED");
+			RemoveDrawObject("TTFM_CISD_CONFIRMED_LABEL");
+			RemoveDrawObject("TTFM_CISD_PENDING_BULL");
+			RemoveDrawObject("TTFM_CISD_PENDING_BULL_LABEL");
+			RemoveDrawObject("TTFM_CISD_PENDING_BEAR");
+			RemoveDrawObject("TTFM_CISD_PENDING_BEAR_LABEL");
 		}
 
 		private void DrawTSpot(TTFM_Context context)
@@ -1136,13 +1699,13 @@ namespace NinjaTrader.NinjaScript.Strategies
 			int c2BarsAgo;
 			int c3BarsAgo;
 			if (!FindLatestActiveScannedSequence(out direction, out c2BarsAgo, out c3BarsAgo))
-				return;
+					return;
 
 			double offset = Math.Max(TickSize, CLabelTickOffset * TickSize);
 			DrawFractalText("TTFM_C2_SCAN_ACTIVE", "C2", c2BarsAgo, direction > 0 ? Low[c2BarsAgo] - offset : High[c2BarsAgo] + offset);
 			DrawFractalText("TTFM_C3_SCAN_ACTIVE", "C3", c3BarsAgo, direction > 0 ? Low[c3BarsAgo] - offset : High[c3BarsAgo] + offset);
 
-			int maxNumber = Math.Min(5, 3 + Math.Max(0, c3BarsAgo));
+			int maxNumber = Math.Min(6, 3 + Math.Max(0, c3BarsAgo));
 			for (int number = 4; number <= maxNumber; number++)
 			{
 				int barsAgo = c3BarsAgo - (number - 3);
@@ -1166,7 +1729,7 @@ namespace NinjaTrader.NinjaScript.Strategies
 				return false;
 
 			int ageFromC3 = scanC3BarsAgo;
-			if (ageFromC3 < 0 || ageFromC3 >= 3)
+			if (ageFromC3 < 0 || ageFromC3 > 3)
 				return false;
 
 			if (IsScannedSequenceBroken(scanDirection, scanC2BarsAgo, scanC3BarsAgo))
@@ -1183,18 +1746,20 @@ namespace NinjaTrader.NinjaScript.Strategies
 			if (direction == 0 || c2BarsAgo < 0 || c3BarsAgo < 0)
 				return true;
 
+			if (c3BarsAgo > 0 && IsC4FailedContinuation(direction, High[c3BarsAgo - 1], Low[c3BarsAgo - 1], High[c3BarsAgo], Low[c3BarsAgo]))
+				return true;
+
 			double c2Protected = direction > 0 ? Low[c2BarsAgo] : High[c2BarsAgo];
-			double c3Eq = (High[c3BarsAgo] + Low[c3BarsAgo]) * 0.5;
 			for (int barsAgo = c3BarsAgo - 1; barsAgo >= 0; barsAgo--)
 			{
 				if (direction > 0)
 				{
-					if (Low[barsAgo] < c2Protected || Low[barsAgo] < c3Eq)
+					if (Low[barsAgo] < c2Protected)
 						return true;
 				}
 				else
 				{
-					if (High[barsAgo] > c2Protected || High[barsAgo] > c3Eq)
+					if (High[barsAgo] > c2Protected)
 						return true;
 				}
 			}
@@ -1239,12 +1804,6 @@ namespace NinjaTrader.NinjaScript.Strategies
 				int ageFromC2 = activeC2BarsAgo - barsAgo;
 				if (ageFromC2 < 1)
 					continue;
-				if (ageFromC2 > Math.Max(1, MaxBarsToWaitC3))
-				{
-					activeDirection = 0;
-					activeC2BarsAgo = -1;
-					continue;
-				}
 
 				bool bullC3 = activeDirection > 0 && IsBullExpansion(Low[activeC2BarsAgo], High[activeC2BarsAgo], Low[barsAgo], Close[barsAgo], RequireStrongC3Close);
 				bool bearC3 = activeDirection < 0 && IsBearExpansion(Low[activeC2BarsAgo], High[activeC2BarsAgo], High[barsAgo], Close[barsAgo], RequireStrongC3Close);
@@ -1326,6 +1885,7 @@ namespace NinjaTrader.NinjaScript.Strategies
 				"key=" + context.Key + Environment.NewLine +
 				"instrument=" + context.Instrument + Environment.NewLine +
 				"profile=" + context.Profile + Environment.NewLine +
+				"context_tf_minutes=" + context.ContextTfMinutes + Environment.NewLine +
 				"published_at=" + context.PublishedAt.ToString("yyyy-MM-dd HH:mm:ss", CultureInfo.InvariantCulture) + Environment.NewLine +
 				"bar_time=" + context.BarTime.ToString("yyyy-MM-dd HH:mm:ss", CultureInfo.InvariantCulture) + Environment.NewLine +
 				"price=" + RawPrice(context.CurrentPrice) + Environment.NewLine +
@@ -1337,6 +1897,20 @@ namespace NinjaTrader.NinjaScript.Strategies
 				"setup_id=" + context.SetupId + Environment.NewLine +
 				"setup_age_bars=" + context.SetupAgeBars + Environment.NewLine +
 				"failure_reason=" + context.FailureReason + Environment.NewLine +
+				"child_context_key=" + context.ChildContextKey + Environment.NewLine +
+				"child_tf_minutes=" + context.ChildTfMinutes + Environment.NewLine +
+				"child_bar_time=" + context.ChildBarTime.ToString("yyyy-MM-dd HH:mm:ss", CultureInfo.InvariantCulture) + Environment.NewLine +
+				"child_parent_candle_number=" + context.ChildParentCandleNumber + Environment.NewLine +
+				"child_parent_candle_start=" + context.ChildParentCandleStartTime.ToString("yyyy-MM-dd HH:mm:ss", CultureInfo.InvariantCulture) + Environment.NewLine +
+				"child_parent_candle_end=" + context.ChildParentCandleEndTime.ToString("yyyy-MM-dd HH:mm:ss", CultureInfo.InvariantCulture) + Environment.NewLine +
+				"child_parent_candle_high=" + RawPrice(context.ChildParentCandleHigh) + Environment.NewLine +
+				"child_parent_candle_low=" + RawPrice(context.ChildParentCandleLow) + Environment.NewLine +
+				"child_parent_candle_open=" + RawPrice(context.ChildParentCandleOpen) + Environment.NewLine +
+				"child_parent_candle_close=" + RawPrice(context.ChildParentCandleClose) + Environment.NewLine +
+				"is_inside_parent_candle_window=" + context.IsInsideParentCandleWindow + Environment.NewLine +
+				"ai_interface_version=" + context.AiInterfaceVersion + Environment.NewLine +
+				"ai_setup_gate=" + context.AiSetupGate + Environment.NewLine +
+				"ai_setup_gate_reason=" + context.AiSetupGateReason + Environment.NewLine +
 				"sequence_direction=" + context.SequenceDirection + Environment.NewLine +
 				"current_candle_number=" + context.CurrentCandleNumber + Environment.NewLine +
 				"tspot_touched=" + context.TSpotTouched + Environment.NewLine +
@@ -1374,6 +1948,16 @@ namespace NinjaTrader.NinjaScript.Strategies
 				"c4_open=" + RawPrice(context.C4Open) + Environment.NewLine +
 				"c4_close=" + RawPrice(context.C4Close) + Environment.NewLine +
 				"c4_time=" + context.C4Time.ToString("yyyy-MM-dd HH:mm:ss", CultureInfo.InvariantCulture) + Environment.NewLine +
+				"c5_high=" + RawPrice(context.C5High) + Environment.NewLine +
+				"c5_low=" + RawPrice(context.C5Low) + Environment.NewLine +
+				"c5_open=" + RawPrice(context.C5Open) + Environment.NewLine +
+				"c5_close=" + RawPrice(context.C5Close) + Environment.NewLine +
+				"c5_time=" + context.C5Time.ToString("yyyy-MM-dd HH:mm:ss", CultureInfo.InvariantCulture) + Environment.NewLine +
+				"c6_high=" + RawPrice(context.C6High) + Environment.NewLine +
+				"c6_low=" + RawPrice(context.C6Low) + Environment.NewLine +
+				"c6_open=" + RawPrice(context.C6Open) + Environment.NewLine +
+				"c6_close=" + RawPrice(context.C6Close) + Environment.NewLine +
+				"c6_time=" + context.C6Time.ToString("yyyy-MM-dd HH:mm:ss", CultureInfo.InvariantCulture) + Environment.NewLine +
 				"t_spot_upper=" + RawPrice(context.TSpotUpper) + Environment.NewLine +
 				"t_spot_lower=" + RawPrice(context.TSpotLower) + Environment.NewLine +
 				"protected_swing=" + RawPrice(context.ProtectedSwing) + Environment.NewLine +
@@ -1384,9 +1968,11 @@ namespace NinjaTrader.NinjaScript.Strategies
 				"nearest_bull_zone_top=" + RawPrice(context.NearestBullZoneTop) + Environment.NewLine +
 				"nearest_bull_zone_bottom=" + RawPrice(context.NearestBullZoneBottom) + Environment.NewLine +
 				"nearest_bull_zone_ce=" + RawPrice(context.NearestBullZoneCE) + Environment.NewLine +
+				"nearest_bull_zone_start=" + context.NearestBullZoneStartTime.ToString("yyyy-MM-dd HH:mm:ss", CultureInfo.InvariantCulture) + Environment.NewLine +
 				"nearest_bear_zone_top=" + RawPrice(context.NearestBearZoneTop) + Environment.NewLine +
 				"nearest_bear_zone_bottom=" + RawPrice(context.NearestBearZoneBottom) + Environment.NewLine +
 				"nearest_bear_zone_ce=" + RawPrice(context.NearestBearZoneCE) + Environment.NewLine +
+				"nearest_bear_zone_start=" + context.NearestBearZoneStartTime.ToString("yyyy-MM-dd HH:mm:ss", CultureInfo.InvariantCulture) + Environment.NewLine +
 				"narrative=" + context.Narrative + Environment.NewLine;
 		}
 
@@ -1416,6 +2002,11 @@ namespace NinjaTrader.NinjaScript.Strategies
 			return price >= Math.Min(a, b) && price <= Math.Max(a, b);
 		}
 
+		private bool SamePrice(double a, double b)
+		{
+			return IsValidPrice(a) && IsValidPrice(b) && Math.Abs(a - b) <= Math.Max(TickSize * 0.5, 1e-10);
+		}
+
 		private bool IsValidPrice(double price)
 		{
 			return price > 0 && !double.IsNaN(price) && !double.IsInfinity(price);
@@ -1426,6 +2017,11 @@ namespace NinjaTrader.NinjaScript.Strategies
 			if (!IsValidPrice(price))
 				return "-";
 			return Instrument.MasterInstrument.FormatPrice(price);
+		}
+
+		private string FormatTime(DateTime time)
+		{
+			return time == Core.Globals.MinDate ? "-" : time.ToString("yyyy-MM-dd HH:mm", CultureInfo.InvariantCulture);
 		}
 
 		private string FormatZone(double top, double bottom)
@@ -1454,6 +2050,16 @@ namespace NinjaTrader.NinjaScript.Strategies
 			if (double.IsNaN(ticks) || double.IsInfinity(ticks))
 				return "-";
 			return ticks.ToString("0.#", CultureInfo.InvariantCulture);
+		}
+
+		private class CisdCandle
+		{
+			public double Open;
+			public double High;
+			public double Low;
+			public double Close;
+			public DateTime Time;
+			public int Direction;
 		}
 
 		[NinjaScriptProperty]
